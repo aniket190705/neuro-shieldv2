@@ -246,18 +246,9 @@ function parseTimestamp(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function computeFatigueScore(riskLevel, confidence) {
-  const boundedConfidence = clamp(Number(confidence) || 0, 0, 1);
-
-  if (riskLevel === "HIGH") {
-    return Math.round(72 + boundedConfidence * 24);
-  }
-
-  if (riskLevel === "MEDIUM") {
-    return Math.round(46 + boundedConfidence * 22);
-  }
-
-  return Math.round(14 + boundedConfidence * 24);
+function computeFatigueScore(rawFatigueScore) {
+  const boundedScore = clamp(Number(rawFatigueScore) || 0, 0, 4);
+  return Math.round((boundedScore / 4) * 100);
 }
 
 function getRiskSummaryText(riskLevel) {
@@ -369,7 +360,7 @@ function deriveStateFromLogs(logs) {
   const tabSwitchCount = Math.round(Number(telemetry.tab_switches) || 0);
   const modelConfidence = Math.round(clamp(Number(latest?.score) || 0, 0, 1) * 100);
   const riskLevel = latest?.risk || "LOW";
-  const fatigueScore = computeFatigueScore(riskLevel, Number(latest?.score) || 0);
+  const fatigueScore = computeFatigueScore(latest?.fatigue_score);
   const sessionDuration = firstTimestamp && latestTimestamp
     ? Math.max(1, Math.round((latestTimestamp - firstTimestamp) / 60000))
     : Math.max(1, Math.round((logs.length * 5) / 60));
@@ -384,17 +375,13 @@ function deriveStateFromLogs(logs) {
     recentLogs.map((entry) => Number(entry?.telemetry?.mouse_distance) || 0)
   );
   const scoreBaseline = average(
-    recentLogs.map((entry) =>
-      computeFatigueScore(entry?.risk || "LOW", Number(entry?.score) || 0)
-    )
+    recentLogs.map((entry) => computeFatigueScore(entry?.fatigue_score))
   );
 
   const baselineTypingDelta = Math.round(percentDelta(typingSpeed, typingBaseline));
   const baselineSwitchDelta = Math.round(percentDelta(tabSwitchCount, switchBaseline));
   const quietStreak = computeQuietStreak(logs);
-  const trend = chartLogs.map((entry) =>
-    computeFatigueScore(entry?.risk || "LOW", Number(entry?.score) || 0)
-  );
+  const trend = chartLogs.map((entry) => computeFatigueScore(entry?.fatigue_score));
 
   while (trend.length < 7) {
     trend.unshift(trend[0] ?? 0);
@@ -426,7 +413,7 @@ function deriveStateFromLogs(logs) {
       detail: `The extension observed ${tabSwitchCount} tab switches this batch against a recent baseline of ${switchBaseline.toFixed(1)}.`,
     }),
     {
-      label: "Predicted confidence",
+      label: "Model confidence",
       icon: BrainCircuit,
       trend: fatigueScore >= scoreBaseline ? "up" : "down",
       tone: riskLevel === "HIGH" ? "bad" : "good",

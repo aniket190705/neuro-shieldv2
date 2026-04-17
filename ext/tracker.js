@@ -1,5 +1,6 @@
 (() => {
   let keystrokes = 0;
+  let backspaces = 0;
   let mouseDistance = 0;
   let lastMousePos = null;
 
@@ -23,10 +24,22 @@
     });
   };
 
+  const notifyTabSwitch = () => {
+    chrome.runtime.sendMessage({ type: "TAB_SWITCH_EVENT" }, () => {
+      if (chrome.runtime.lastError) {
+        console.error("Tab switch tracking failed:", chrome.runtime.lastError.message);
+      }
+    });
+  };
+
   document.addEventListener(
     "keydown",
-    () => {
-        keystrokes += 1;
+    (event) => {
+      keystrokes += 1;
+
+      if (event.key === "Backspace") {
+        backspaces += 1;
+      }
     },
     { passive: true }
   );
@@ -47,8 +60,13 @@
     { passive: true }
   );
 
-  const isPageActive = () =>
-    document.visibilityState === "visible" && document.hasFocus();
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      notifyTabSwitch();
+    }
+  });
+
+  const isPageActive = () => document.visibilityState === "visible";
 
   setInterval(() => {
     if (!isPageActive()) {
@@ -59,12 +77,14 @@
       timestamp: new Date().toISOString(),
       metrics: {
         keys_pressed: keystrokes,
+        backspaces,
         mouse_travel_pixels: Math.round(mouseDistance),
         tab_switches: 0
       }
     };
 
     keystrokes = 0;
+    backspaces = 0;
     mouseDistance = 0;
 
     sendTelemetry(payload);

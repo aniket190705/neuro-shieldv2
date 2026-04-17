@@ -7,7 +7,11 @@ const path = require("path");
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_LOGS = 100;
+const FATIGUE_WINDOW_SIZE = 4;
+const FATIGUE_HIGH_THRESHOLD = 2.8;
+const FATIGUE_MEDIUM_THRESHOLD = 1.45;
 const logs = [];
+const recentFatigueDeltas = [];
 
 const RISK_LABELS = {
   0: "LOW",
@@ -87,10 +91,38 @@ function buildFallbackResponse(input) {
     risk: "MEDIUM",
     score: 0.5,
     risk_index: 1,
+    fatigue_score: 0,
+    fatigue_delta: 0,
     telemetry: input,
     source: "fallback",
     timestamp: new Date().toISOString(),
   };
+}
+
+function pushFatigueDelta(delta) {
+  recentFatigueDeltas.push(delta);
+
+  if (recentFatigueDeltas.length > FATIGUE_WINDOW_SIZE) {
+    recentFatigueDeltas.splice(0, recentFatigueDeltas.length - FATIGUE_WINDOW_SIZE);
+  }
+}
+
+function getRollingFatigueScore() {
+  return Number(
+    recentFatigueDeltas.reduce((total, value) => total + value, 0).toFixed(4)
+  );
+}
+
+function getAggregatedRiskIndex(fatigueScore) {
+  if (fatigueScore >= FATIGUE_HIGH_THRESHOLD) {
+    return 2;
+  }
+
+  if (fatigueScore >= FATIGUE_MEDIUM_THRESHOLD) {
+    return 1;
+  }
+
+  return 0;
 }
 
 function readMetricCandidate(body, nestedKey, flatKeys) {
@@ -108,7 +140,7 @@ function readMetricCandidate(body, nestedKey, flatKeys) {
   return undefined;
 }
 
-function predictWithPython({ keys, mouse_distance, tab_switches }) {
+function predictWithPython({ keys, mouse_distance, tab_switches, backspaces }) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       PYTHON_RUNTIME.command,
@@ -118,6 +150,7 @@ function predictWithPython({ keys, mouse_distance, tab_switches }) {
         String(keys),
         String(mouse_distance),
         String(tab_switches),
+        String(backspaces),
       ],
       {
         cwd: __dirname,
@@ -170,11 +203,15 @@ function validateTelemetry(body) {
   const tabSwitches = Number(
     readMetricCandidate(body, "tab_switches", ["tab_switches"])
   );
+  const backspaces = Number(
+    readMetricCandidate(body, "backspaces", ["backspaces"])
+  );
 
   if (
     !Number.isFinite(keys) ||
     !Number.isFinite(mouseDistance) ||
-    !Number.isFinite(tabSwitches)
+    !Number.isFinite(tabSwitches) ||
+    !Number.isFinite(backspaces)
   ) {
     return null;
   }
@@ -183,6 +220,7 @@ function validateTelemetry(body) {
     keys: Math.round(Number(keys)),
     mouse_distance: Number(mouseDistance),
     tab_switches: Math.round(Number(tabSwitches)),
+    backspaces: Math.round(Number(backspaces)),
     timestamp: body?.timestamp || new Date().toISOString(),
   };
 }
@@ -197,7 +235,7 @@ app.post("/api/telemetry", async (req, res) => {
   if (!telemetry) {
     res.status(400).json({
       error:
-        "Invalid telemetry payload. Expected metrics.keys_pressed, metrics.mouse_travel_pixels, metrics.tab_switches or flat equivalents.",
+        "Invalid telemetry payload. Expected metrics.keys_pressed, metrics.backspaces, metrics.mouse_travel_pixels, metrics.tab_switches or flat equivalents.",
     });
     return;
   }
@@ -206,10 +244,20 @@ app.post("/api/telemetry", async (req, res) => {
 
   try {
     const prediction = await predictWithPython(telemetry);
+    const fatigueDelta = Number(prediction.fatigue_delta) || 0;
+    pushFatigueDelta(fatigueDelta);
+    const fatigueScore = getRollingFatigueScore();
+    const aggregatedRiskIndex = getAggregatedRiskIndex(fatigueScore);
+
     responsePayload = {
-      risk: RISK_LABELS[prediction.risk_index] || "MEDIUM",
+      risk: RISK_LABELS[aggregatedRiskIndex] || "MEDIUM",
       score: Number(prediction.probability) || 0.5,
-      risk_index: prediction.risk_index,
+      risk_index: aggregatedRiskIndex,
+      fatigue_score: fatigueScore,
+      fatigue_delta: fatigueDelta,
+      window_risk: RISK_LABELS[prediction.risk_index] || "MEDIUM",
+      window_risk_index: prediction.risk_index,
+      feature_weights: prediction.feature_weights,
       telemetry,
       source: "model",
       timestamp: telemetry.timestamp,

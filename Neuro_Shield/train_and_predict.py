@@ -1,4 +1,5 @@
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -13,83 +14,180 @@ from xgboost import XGBClassifier
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "telemetry_data.csv"
 MODEL_PATH = BASE_DIR / "fatigue_model.pkl"
-FEATURE_COLUMNS = ["keys", "mouse_distance", "tab_switches"]
+FEATURE_COLUMNS = ["keys", "mouse_distance", "tab_switches", "backspaces"]
+FEATURE_WEIGHTS = {
+    "backspaces": 0.4,
+    "tab_switches": 0.3,
+    "keys": 0.2,
+    "mouse_distance": 0.1,
+}
 
 
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
-def derive_risk(keys, mouse_distance, tab_switches):
-    score = 0.0
+def compute_feature_components(keys, mouse_distance, tab_switches, backspaces):
+    reader_mode = (
+        keys == 0
+        and tab_switches == 0
+        and mouse_distance < 500
+        and backspaces <= 1
+    )
 
-    if keys < 75:
-        score += 1.5
-    elif keys < 150:
-        score += 1.0
+    if reader_mode:
+        return {
+            "reader_mode": True,
+            "keys": 0.0,
+            "mouse_distance": 0.0,
+            "tab_switches": 0.0,
+            "backspaces": 0.0,
+        }
+
+    if keys >= 15:
+        keys_component = 0.05
+    elif keys >= 5:
+        keys_component = 0.55
     else:
-        score -= 0.2
+        keys_component = 1.0
 
-    if mouse_distance < 120:
-        score += 1.0
-    elif mouse_distance < 260:
-        score += 0.5
+    if mouse_distance < 1000:
+        mouse_component = 0.1
+    elif mouse_distance < 2000:
+        mouse_component = 0.45
     else:
-        score -= 0.2
+        mouse_component = 0.8
 
-    if tab_switches >= 18:
-        score += 1.5
-    elif tab_switches >= 10:
-        score += 0.8
+    if tab_switches <= 1:
+        tab_component = 0.05
+    elif tab_switches == 2:
+        tab_component = 0.6
+    else:
+        tab_component = 1.0
 
-    if keys < 90 and tab_switches >= 14:
-        score += 1.8
+    if backspaces <= 2:
+        backspace_component = 0.05
+    elif backspaces <= 5:
+        backspace_component = 0.6
+    else:
+        backspace_component = 1.0
 
-    if keys > 220 and mouse_distance > 320 and tab_switches < 8:
-        score -= 0.8
+    return {
+        "reader_mode": False,
+        "keys": keys_component,
+        "mouse_distance": mouse_component,
+        "tab_switches": tab_component,
+        "backspaces": backspace_component,
+    }
 
-    if score >= 3.2:
+
+def compute_fatigue_delta(keys, mouse_distance, tab_switches, backspaces):
+    components = compute_feature_components(
+        keys, mouse_distance, tab_switches, backspaces
+    )
+
+    if components["reader_mode"]:
+        return 0.0
+
+    delta = sum(
+        FEATURE_WEIGHTS[feature] * components[feature]
+        for feature in FEATURE_COLUMNS
+    )
+
+    if backspaces >= 6 and keys <= 4:
+        delta += 0.12
+
+    if tab_switches >= 3 and backspaces >= 6:
+        delta += 0.08
+
+    if keys <= 4 and mouse_distance >= 2000:
+        delta += 0.06
+
+    if keys >= 15 and backspaces <= 2 and tab_switches <= 1:
+        delta -= 0.08
+
+    return round(clamp(delta, 0.0, 1.0), 4)
+
+
+def derive_risk(keys, mouse_distance, tab_switches, backspaces):
+    fatigue_delta = compute_fatigue_delta(
+        keys, mouse_distance, tab_switches, backspaces
+    )
+
+    if fatigue_delta >= 0.72:
         return 2
-    if score >= 1.7:
+    if fatigue_delta >= 0.36:
         return 1
     return 0
 
 
 def build_synthetic_dataset(row_count=1500):
+    rng = random.Random(42)
     records = []
 
-    for index in range(row_count):
-        keys = 20 + ((index * 37 + 11) % 281)
-        mouse_distance = round(15 + ((index * 29 + 7) % 486) + ((index % 9) * 0.37), 2)
-        tab_switches = (index * 11 + 5) % 26
+    samples_per_state = row_count // 3
 
-        if index % 10 == 0:
-            keys = 30 + (index % 45)
-            tab_switches = 15 + (index % 10)
-
-        if index % 14 == 0:
-            keys = 210 + (index % 70)
-            mouse_distance = round(280 + (index % 160) + 0.25, 2)
-            tab_switches = index % 7
-
-        if index % 17 == 0:
-            mouse_distance = round(40 + (index % 70) + 0.5, 2)
-
-        risk = derive_risk(keys, mouse_distance, tab_switches)
-
-        if index % 23 == 0 and risk > 0:
-            risk -= 1
-        elif index % 31 == 0 and risk < 2:
-            risk += 1
-
+    def add_record(keys, mouse_distance, tab_switches, backspaces):
+        risk = derive_risk(keys, mouse_distance, tab_switches, backspaces)
         records.append(
             {
-                "keys": int(clamp(keys, 0, 400)),
-                "mouse_distance": float(round(clamp(mouse_distance, 0.0, 700.0), 2)),
-                "tab_switches": int(clamp(tab_switches, 0, 30)),
+                "keys": int(clamp(keys, 0, 40)),
+                "mouse_distance": float(round(clamp(mouse_distance, 0.0, 5000.0), 2)),
+                "tab_switches": int(clamp(tab_switches, 0, 10)),
+                "backspaces": int(clamp(backspaces, 0, 20)),
                 "risk_index": int(clamp(risk, 0, 2)),
             }
         )
+
+    for _ in range(samples_per_state):
+        low_mode = rng.choice(["focused", "reader"])
+
+        if low_mode == "reader":
+            keys = rng.randint(0, 3)
+            mouse_distance = rng.uniform(0, 450)
+            tab_switches = 0
+            backspaces = rng.randint(0, 1)
+        else:
+            keys = rng.randint(15, 28)
+            mouse_distance = rng.uniform(150, 900)
+            tab_switches = rng.randint(0, 1)
+            backspaces = rng.randint(0, 2)
+
+        add_record(keys, mouse_distance, tab_switches, backspaces)
+
+    for _ in range(samples_per_state):
+        keys = rng.randint(5, 14)
+        mouse_distance = rng.uniform(1000, 2000)
+        tab_switches = 2
+        backspaces = rng.randint(3, 5)
+
+        if rng.random() < 0.2:
+            mouse_distance += rng.uniform(-250, 250)
+        if rng.random() < 0.2:
+            backspaces += rng.choice([-1, 1])
+
+        add_record(keys, mouse_distance, tab_switches, backspaces)
+
+    for _ in range(row_count - (samples_per_state * 2)):
+        keys = rng.randint(0, 4)
+        mouse_distance = rng.uniform(2000, 4200)
+        tab_switches = rng.randint(3, 6)
+        backspaces = rng.randint(6, 12)
+
+        if rng.random() < 0.15:
+            keys = rng.randint(2, 7)
+        if rng.random() < 0.15:
+            mouse_distance += rng.uniform(-400, 400)
+
+        add_record(keys, mouse_distance, tab_switches, backspaces)
+
+    for _ in range(max(30, row_count // 12)):
+        keys = rng.randint(0, 18)
+        mouse_distance = rng.uniform(200, 2800)
+        tab_switches = rng.randint(0, 5)
+        backspaces = rng.randint(0, 8)
+
+        add_record(keys, mouse_distance, tab_switches, backspaces)
 
     return pd.DataFrame(records)
 
@@ -175,7 +273,7 @@ def load_model_bundle():
     return joblib.load(MODEL_PATH)
 
 
-def predict_risk(keys, mouse_distance, tab_switches):
+def predict_risk(keys, mouse_distance, tab_switches, backspaces):
     bundle = load_model_bundle()
     model = bundle["model"]
     feature_columns = bundle["feature_columns"]
@@ -186,6 +284,7 @@ def predict_risk(keys, mouse_distance, tab_switches):
                 "keys": int(keys),
                 "mouse_distance": float(mouse_distance),
                 "tab_switches": int(tab_switches),
+                "backspaces": int(backspaces),
             }
         ]
     )[feature_columns]
@@ -193,16 +292,25 @@ def predict_risk(keys, mouse_distance, tab_switches):
     risk_index = int(model.predict(frame)[0])
     probabilities = model.predict_proba(frame)[0]
     probability = round(float(probabilities[risk_index]), 4)
+    fatigue_delta = compute_fatigue_delta(
+        keys, mouse_distance, tab_switches, backspaces
+    )
 
-    return {"risk_index": risk_index, "probability": probability}
+    return {
+        "risk_index": risk_index,
+        "probability": probability,
+        "fatigue_delta": fatigue_delta,
+        "feature_weights": FEATURE_WEIGHTS,
+    }
 
 
 def main():
-    if len(sys.argv) == 4:
+    if len(sys.argv) == 5:
         keys = int(sys.argv[1])
         mouse_distance = float(sys.argv[2])
         tab_switches = int(sys.argv[3])
-        print(json.dumps(predict_risk(keys, mouse_distance, tab_switches)))
+        backspaces = int(sys.argv[4])
+        print(json.dumps(predict_risk(keys, mouse_distance, tab_switches, backspaces)))
         return
 
     train_and_save_model()
